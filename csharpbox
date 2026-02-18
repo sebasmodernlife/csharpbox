@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import re
+import stat
+import subprocess
+from pathlib import Path
+
+DEFAULT_ROOT = Path.home() / "Dev" / "Projects"
+
+
+def sh(cmd: list[str], cwd: Path | None = None) -> None:
+    subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=True)
+
+
+def write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = content.replace("\r\n", "\n").replace("\r", "\n")
+    # Quita BOM si existiera
+    if content.startswith("\ufeff"):
+        content = content.lstrip("\ufeff")
+    path.write_text(content, encoding="utf-8", newline="\n")
+
+
+def exe(path: Path, content: str) -> None:
+    write(path, content)
+    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def sanitize_tag(name: str) -> str:
+    s = re.sub(r"[^a-zA-Z0-9_.-]+", "-", name.strip()).strip("-").lower()
+    return s or "repo"
+
+
+DOCKERFILE_TMPL = r"""\
+FROM mcr.microsoft.com/dotnet/sdk:{dotnet}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 \
+    DOTNET_CLI_TELEMETRY_OPTOUT=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl git \
+    ripgrep fd-find \
+    unzip xz-utils tar gzip \
+    build-essential cmake pkg-config ninja-build gettext \
+    libtool libtool-bin autoconf automake \
+    python3 python3-pip \
+    nodejs npm \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN ln -sf "$(command -v fdfind)" /usr/local/bin/fd
+
+# ---- Neovim 0.11.2 (build) ----
+ARG NVIM_REF=v0.11.2
+RUN set -eux; \
+    rm -f /usr/bin/nvim /usr/local/bin/nvim || true; \
+    git clone --depth 1 --branch "$NVIM_REF" https://github.com/neovim/neovim /tmp/neovim; \
+    cd /tmp/neovim; \
+    make CMAKE_BUILD_TYPE=RelWithDebInfo; \
+    make install; \
+    cd /; \
+    rm -rf /tmp/neovim; \
+    nvim --version | head -n 1
+
+WORKDIR /work
+CMD ["bash"]
+"""
+
+
+ENTRYPOINT_TMPL = r"""\
+#!/usr/bin/env bash
+set -euo pipefail
+
+TARGET_UID="${TARGET_UID:-1000}"
+TARGET_USER="$(getent passwd "$TARGET_UID" | cut -d: -f1 || true)"
+[[ -z "$TARGET_USER" ]] && TARGET_USER="ubuntu"
+
+TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6 || true)"
+[[ -z "$TARGET_HOME" ]] && TARGET_HOME="/home/$TARGET_USER"
+
+mkdir -p \
+  "$TARGET_HOME/.local/share/nvim" \
+  "$TARGET_HOME/.local/state/nvim" \
+  "$TARGET_HOME/.cache/nvim" \
+  "$TARGET_HOME/.cache/tree-sitter" \
+  "$TARGET_HOME/.local/share/NuGet" \
+  "$TARGET_HOME/.nuget"
+
+# NO chown ~/.config (viene RO). Solo cache/local.
+chown -R "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/.cache" || true
+chown -R "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/.local" || true
+chown -R "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/.nuget" || true
+
+exec su -s /bin/bash "$TARGET_USER" -c "$*"
+"""
+
+
+# YAML minimalista (sin listas raras) -> evita el error de "mapping values..."
+COMPOSE_TMPL = """\
+services:
+  dev:
+    image: ${IMAGE_TAG}
+    working_dir: /work
+    env_file:
+      - .env
+
+    user: "0"
+    entrypoint: bash /work/.dev/entrypoint.sh
+    command: bash
+
+    environment:
+      TARGET_UID: "1000"
+
+    volumes:
+      - ..:/work
+      - ${HOME}/.config/nvim:/home/ubuntu/.config/nvim:ro
+      - ../.dev/lazy-lock.json:/home/ubuntu/.config/nvim/lazy-lock.json:rw
+      - nvim_data:/home/ubuntu/.local/share/nvim
+      - nvim_state:/home/ubuntu/.local/state/nvim
+      - nvim_cache:/home/ubuntu/.cache/nvim
+      - nuget_cache:/home/ubuntu/.local/share/NuGet
+
+    ports:
+      - "${DEV_PORT}:${DEV_PORT}"
+
+    tty: true
+    stdin_open: true
+
+volumes:
+  nvim_data:
+  nvim_state:
+  nvim_cache:
+  nuget_cache:
+"""
+
+
+SCRIPT_DEV = r"""\
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+DEV_DIR="$REPO_ROOT/.dev"
+ENV_FILE="$DEV_DIR/.env"
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo "Falta '$1' en el host."; exit 1; }; }
+need docker
+
+compose() {
+  ( cd "$REPO_ROOT" && docker compose -f "$DEV_DIR/compose.yml" "$@" ) 2>/dev/null \
+  || ( cd "$REPO_ROOT" && docker-compose -f "$DEV_DIR/compose.yml" "$@" )
+}
+
+build_image() {
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  docker image inspect "$IMAGE_TAG" >/dev/null 2>&1 || \
+    docker build -t "$IMAGE_TAG" -f "$DEV_DIR/Dockerfile" "$DEV_DIR"
+}
+
+export REPO_ROOT DEV_DIR ENV_FILE
+export -f compose build_image
+"""
+
+
+SCRIPT_DEV_SHELL = r"""\
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(dirname "$0")/dev"
+build_image
+compose run --rm -it dev bash
+"""
+
+
+SCRIPT_DEV_NVIM = r"""\
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(dirname "$0")/dev"
+build_image
+compose run --rm -it dev nvim
+"""
+
+
+SCRIPT_DEV_CLEAN = r"""\
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(dirname "$0")/dev"
+echo ">> Bajando contenedor y eliminando volúmenes del repo (nvim + nuget)..."
+compose down -v || true
+echo ">> Listo."
+"""
+
+
+SCRIPT_DEV_DOTNET = r"""\
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(dirname "$0")/dev"
+build_image
+
+run_in_container() { compose run --rm -it --service-ports dev "$@"; }
+
+action="${1:-}"
+shift || true
+
+case "$action" in
+  bootstrap-webapi)
+    repo_name="$(basename "$REPO_ROOT")"
+    sln="${repo_name}.sln"
+    api="${repo_name}.Api"
+
+    if [[ -f "$REPO_ROOT/$sln" ]]; then
+      echo ">> Ya existe $sln"
+      exit 0
+    fi
+
+    run_in_container dotnet new sln -n "$repo_name"
+    run_in_container dotnet new webapi -n "$api"
+    run_in_container dotnet sln "$sln" add "$api/$api.csproj"
+    run_in_container dotnet restore "$sln"
+    echo ">> Bootstrap listo."
+    ;;
+
+  watch)
+    proj="$(cd "$REPO_ROOT" && find . -maxdepth 8 -type f -name "*.csproj" | head -n 1 || true)"
+    [[ -z "${proj:-}" ]] && { echo "No encontré .csproj"; exit 1; }
+
+    run_in_container env ASPNETCORE_URLS="http://0.0.0.0:${DEV_PORT}" \
+      dotnet watch run --project "$proj" --urls "http://0.0.0.0:${DEV_PORT}"
+    ;;
+
+  run)
+    proj="$(cd "$REPO_ROOT" && find . -maxdepth 8 -type f -name "*.csproj" | head -n 1 || true)"
+    [[ -z "${proj:-}" ]] && { echo "No encontré .csproj"; exit 1; }
+
+    run_in_container env ASPNETCORE_URLS="http://0.0.0.0:${DEV_PORT}" \
+      dotnet run --project "$proj" --urls "http://0.0.0.0:${DEV_PORT}"
+    ;;
+
+  cmd)
+    [[ "${1:-}" == "--" ]] || { echo "Usa: ./dev-dotnet cmd -- <args>"; exit 1; }
+    shift
+    run_in_container dotnet "$@"
+    ;;
+
+  *)
+    cat <<EOF
+Uso:
+  ./dev-dotnet bootstrap-webapi
+  ./dev-dotnet run
+  ./dev-dotnet watch
+  ./dev-dotnet cmd -- <args>
+EOF
+    exit 1
+    ;;
+esac
+"""
+
+
+WRAPPER_DEV = """\
+#!/usr/bin/env bash
+set -euo pipefail
+exec .dev/scripts/dev-nvim
+"""
+WRAPPER_SHELL = """\
+#!/usr/bin/env bash
+set -euo pipefail
+exec .dev/scripts/dev-shell
+"""
+WRAPPER_DOTNET = """\
+#!/usr/bin/env bash
+set -euo pipefail
+exec .dev/scripts/dev-dotnet "$@"
+"""
+WRAPPER_CLEAN = """\
+#!/usr/bin/env bash
+set -euo pipefail
+exec .dev/scripts/dev-clean
+"""
+
+
+GITIGNORE = """\
+# .NET
+bin/
+obj/
+[Bb]in/
+[Oo]bj/
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dev env
+.env
+.env.*
+.dev/.env
+"""
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="csharpbox")
+    ap.add_argument("name", help="Nombre del proyecto/repo (carpeta)")
+    ap.add_argument("--root", default=str(DEFAULT_ROOT), help="Directorio base (default: ~/Dev/Projects)")
+    ap.add_argument("--port", type=int, default=8080, help="Puerto dev (default: 8080)")
+    ap.add_argument("--dotnet", default="8.0-noble", help="Tag dotnet sdk (default: 8.0-noble)")
+    ap.add_argument("--git", action="store_true", help="git init")
+    ap.add_argument("--bootstrap", action="store_true", help="Crea sln + webapi en contenedor")
+    args = ap.parse_args()
+
+    root = Path(args.root).expanduser().resolve()
+    repo = (root / args.name).resolve()
+    repo.mkdir(parents=True, exist_ok=True)
+
+    dev_dir = repo / ".dev"
+    scripts_dir = dev_dir / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+
+    image_tag = f"nvim-dotnet-dev:{sanitize_tag(args.name)}"
+
+    write(dev_dir / "Dockerfile", DOCKERFILE_TMPL.format(dotnet=args.dotnet))
+    write(dev_dir / "compose.yml", COMPOSE_TMPL)
+    write(dev_dir / ".env", f"DEV_PORT={args.port}\nIMAGE_TAG={image_tag}\n")
+    exe(dev_dir / "entrypoint.sh", ENTRYPOINT_TMPL)
+
+    lockfile = dev_dir / "lazy-lock.json"
+    if not lockfile.exists():
+        write(lockfile, "{}\n")
+
+    exe(scripts_dir / "dev", SCRIPT_DEV)
+    exe(scripts_dir / "dev-shell", SCRIPT_DEV_SHELL)
+    exe(scripts_dir / "dev-nvim", SCRIPT_DEV_NVIM)
+    exe(scripts_dir / "dev-dotnet", SCRIPT_DEV_DOTNET)
+    exe(scripts_dir / "dev-clean", SCRIPT_DEV_CLEAN)
+
+    exe(repo / "dev", WRAPPER_DEV)
+    exe(repo / "dev-shell", WRAPPER_SHELL)
+    exe(repo / "dev-dotnet", WRAPPER_DOTNET)
+    exe(repo / "dev-clean", WRAPPER_CLEAN)
+
+    gi = repo / ".gitignore"
+    if not gi.exists():
+        write(gi, GITIGNORE)
+
+    if args.git and not (repo / ".git").exists():
+        sh(["git", "init"], cwd=repo)
+
+    # Valida YAML antes de bootstrap (si falla, te lo dice acá y no más tarde)
+    try:
+        sh(["bash", "-lc", "docker compose -f .dev/compose.yml config >/dev/null"], cwd=repo)
+    except subprocess.CalledProcessError:
+        print("ERROR: compose.yml inválido. Revisa .dev/compose.yml")
+        raise
+
+    if args.bootstrap:
+        sh(["bash", "-lc", "./dev-dotnet bootstrap-webapi"], cwd=repo)
+
+    print(f">> Repo listo: {repo}")
+    print(">> Siguiente:")
+    print(f"   cd {repo}")
+    print("   ./dev               # abre nvim")
+    print("   ./dev-dotnet watch  # levanta API")
+    print(f"   Navegador: http://localhost:{args.port}/weatherforecast")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
