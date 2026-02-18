@@ -1,20 +1,15 @@
-<h1 align="left">CSharpBox</h1>
+⚠️ Este proyecto se encuentra actualmente en estado Alpha.
 
-###
+**csharpbox** es una herramienta CLI para sistemas Unix-like que genera entornos de desarrollo containerizados para programar en .NET usando Neovim + LazyVim.
 
-<p align="left">Este proyecto esta en desarrollo Alpha en estos momentos.<br>El proyecto consiste en un script que sea una herramienta ejecutable para sistemas UnixLike el cual sea capaz de generar entornos devcontainers para programar en .NET desde Neovim + LazyVim con tus configuraciones personales sin verse afectadas por el contenedor pudiendo instalar plugins dentro de ese entorno, todo totalmente automatizado siendo este capaz de parametrizar cosas como "Nombre del Proyecto", "Version SDK", "Puertos", etc.</p>
+Su objetivo es permitir un flujo de trabajo reproducible y aislado, reutilizando tu configuración personal de Neovim sin que el contenedor modifique tu sistema host.
 
-###
+La herramienta automatiza la creación del entorno y permite parametrizar aspectos como:
 
-<h2 align="left"></h2>
+- Nombre del proyecto
+- Versión del SDK de .NET
+- Puertos de desarrollo
+- Bootstrap inicial de APIs
+- Tooling y dependencias aisladas por proyecto
 
-###
-
-<div align="left">
-  <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/csharp/csharp-original.svg" height="40" alt="csharp logo"  />
-  <img width="12" />
-  <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/python/python-original.svg" height="40" alt="python logo"  />
-  <img width="12" />
-  <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/bash/bash-original.svg" height="40" alt="bash logo"  />
-</div>
-
+Diseñado para developers que prefieren un workflow terminal-first y una experiencia similar a devcontainers, pero centrada en Neovim.
